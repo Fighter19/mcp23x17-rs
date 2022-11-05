@@ -48,6 +48,12 @@
 extern crate embedded_hal as hal;
 extern crate bitflags;
 
+use core::{marker::PhantomData, cell::RefCell};
+
+extern crate alloc;
+
+use alloc::vec::Vec;
+use alloc::rc::Rc;
 // use hal::blocking::i2c::{
 //     Write,
 //     WriteRead
@@ -395,5 +401,62 @@ where
 
         self.bus.write_read(ADDRESS, &[reg], &mut data)?;
         Ok(data[0])
+    }
+}
+
+/// A pin managed by an Mcp23s17
+pub struct Mcp23s17Pin<Mcp23s17>
+{
+    mcp: Rc<RefCell<Mcp23s17>>,
+    pin: u8
+}
+
+impl<Bus, E> hal::digital::v2::OutputPin for Mcp23s17Pin<Mcp23s17<Bus>>
+where
+    Bus: spi::Transfer<u8, Error = E>
+{
+    type Error = E;
+
+    fn set_low(&mut self) -> Result<(), Self::Error> {
+        let mut mcp = self.mcp.borrow_mut();
+        
+        let data = mcp.data()?;
+        mcp.set_data(data & !(1 <<self.pin))
+    }
+
+    fn set_high(&mut self) -> Result<(), Self::Error> {
+        let mut mcp = self.mcp.borrow_mut();
+
+        let data = mcp.data()?;
+        mcp.set_data(data | (1 <<self.pin))
+    }
+
+    fn set_state(&mut self, state: hal::digital::v2::PinState) -> Result<(), Self::Error> {
+        match state {
+            hal::digital::v2::PinState::Low => self.set_low(),
+            hal::digital::v2::PinState::High => self.set_high(),
+        }
+    }
+}
+
+/// Errors related to a specific pin
+pub enum Mcp23x17PinError {
+    /// Returned by new in case the specified pin is out of range (Pin 8 or greater)
+    PinOutOfRange
+}
+
+impl<Bus> Mcp23s17Pin<Mcp23s17<Bus>>
+where
+    Bus: spi::Transfer<u8>
+{
+    /// Returns a new pin managed by an mcp
+    pub fn new(mcp: Rc<RefCell<Mcp23s17<Bus>>>, pin: u8) -> Result<Mcp23s17Pin<Mcp23s17<Bus>>, Mcp23x17PinError> {
+        if pin >= 8 {
+            return Err(Mcp23x17PinError::PinOutOfRange);
+        }
+        Ok(Self {
+            mcp,
+            pin
+        })
     }
 }
