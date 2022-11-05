@@ -48,10 +48,11 @@
 extern crate embedded_hal as hal;
 extern crate bitflags;
 
-use hal::blocking::i2c::{
-    Write,
-    WriteRead
-};
+// use hal::blocking::i2c::{
+//     Write,
+//     WriteRead
+// };
+use hal::{blocking::i2c, blocking::spi};
 use bitflags::bitflags;
 
 /// IO Direction. 1 = input, Default 0xff
@@ -113,21 +114,222 @@ bitflags! {
     }
 }
 
-/// 16bit GPIO Expander
-pub struct Mcp23x17<I2C> {
-    i2c: I2C,
+/// 16-bit GPIO Expander (I2C version)
+pub struct Mcp23x17<Bus> {
+    bus: Bus,
     active_port: Port,
 }
 
-impl<I2C, E> Mcp23x17<I2C>
-where
-    I2C: WriteRead<Error = E> + Write<Error = E>,
+/// 16-bit GPIO Expander (SPI version)
+pub struct Mcp23s17<Bus> {
+    bus: Bus,
+    active_port: Port,
+}
+
+/**
+ * Get/Set trait for any bus. Returns Error 'E' on failed operations.
+ */
+pub trait GetSetThing {
+    /// Error to be returned by I/O instructions
+    type Error;
+    /// Set i2c/spi/... register to data
+    fn set_thing(&mut self, register: u8, data: u8) -> Result<(), Self::Error>;
+    /// Get i2c/spi/... register
+    fn get_thing(&mut self, register: u8) -> Result<u8, Self::Error>;
+}
+
+// trait GetPort {
+//     fn get_port(&self, register: u8) -> u8;
+// }
+
+// impl<Bus> GetPort for Mcp23x17<Bus> {
+//     /// Some quick math for the current register
+//     fn get_port(&self, register: u8) -> u8 {
+//         match &self.active_port {
+//             Port::A => register,
+//             Port::B => 0x10 | register
+//         }
+//     }
+// }
+
+/// Functions to be implemented to be able to be treated as an MCP23X17
+pub trait Mcp23x17Ops<Bus, E>: GetSetThing<Error = E>
 {
     /// Create a new instance of the GPIO expander
-    pub fn new(i2c: I2C) -> Result<Self, E> {
+    fn new(bus: Bus) -> Result<Self, E> where Self: Sized;
+
+    /// Some quick math for the current register
+    fn get_port(&self, register: u8) -> u8;
+
+    /// This chip optionally splits its registers between two eight bit ports
+    /// or virtuall one large 16 bit port. This function sets the port
+    /// internally.
+    fn select_port(&mut self, port: Port);
+
+    /// Set the I/O direction for the currently active port. A value
+    /// of 1 is for input, 0 for output
+    fn set_direction(&mut self, data: u8) -> Result<(), E> {
+        Ok(self.set_thing(REG_IODIR, data)?)
+    }
+
+    /// Get the I/O direction for the active port
+    fn direction(&mut self) -> Result<u8, E> {
+        Ok(self.get_thing(REG_IODIR)?)
+    }
+
+    /// Set configuration register. Given the structure of this library and how
+    /// the chip can rearrange its registers, any attempt to set the `BANK` bit
+    /// will be masked to zero.
+    fn set_config(&mut self, data: Config) -> Result<(), E> {
+        // Safety mechanism to avoid breaking the calls made in the library
+        let data = data.bits & !Config::BANK.bits;
+
+        Ok(self.set_thing(REG_CONFIG, data)?)
+    }
+
+    /// Read the data state from the active port
+    fn config(&mut self) -> Result<u8, E> {
+        Ok(self.get_thing(REG_CONFIG)?)
+    }
+
+    /// Set the pullups. A value of 1 enables the 100KOhm pullup.
+    fn set_pullups(&mut self, data: u8) -> Result<(), E> {
+        Ok(self.set_thing(REG_GPPU, data)?)
+    }
+
+    /// Get the pullups.
+    fn pullups(&mut self) -> Result<u8, E> {
+        Ok(self.get_thing(REG_GPPU)?)
+    }
+
+    /// Read interrupt state. Each pin that caused an interrupt will have
+    /// a bit is set. Not settable.
+    /// 
+    /// The value will be reset after a read from `data_at_interrupt` or
+    /// `data()`.
+    fn who_interrupted(&mut self) -> Result<u8, E> {
+        Ok(self.get_thing(REG_INTF)?)
+    }
+
+    /// GPIO value at time of interrupt. It will remain latched to this value
+    /// until another interrupt is fired. While it won't reset on read, it does
+    /// reset the interrupt state on the corresponding interrupt output pin
+    fn data_at_interrupt(&mut self) -> Result<u8, E> {
+        Ok(self.get_thing(REG_INTCAP)?)
+    }
+
+    /// Set a comparison value for the interrupts. The interrupt will
+    /// fire if the input value is *different* from what is set here
+    fn set_int_compare(&mut self, data: u8) -> Result<(), E> {
+        Ok(self.set_thing(REG_DEFVAL, data)?)
+    }
+
+    /// Read interrupt comparison value. Check `set_int_compare()` for more
+    /// details
+    fn int_compare(&mut self) -> Result<u8, E> {
+        Ok(self.get_thing(REG_DEFVAL)?)
+    }
+
+    /// Decide how interrupts will fire. If a bit is set, the input data
+    /// is compared against what's set by `int_compare()`. If unset, the
+    /// interrupt will fire when the pin has changed.
+    fn set_int_control(&mut self, data: u8) -> Result<(), E> {
+        Ok(self.set_thing(REG_INTCON, data)?)
+    }
+
+    /// Read how interrupts will fire. More details on `set_int_control()`.
+    fn int_control(&mut self) -> Result<u8, E> {
+        Ok(self.get_thing(REG_INTCON)?)
+    }
+
+    /// Enable interrupts. If a bit is set, a change on this pin will trigger an
+    /// interrupt. You'll also need to call `set_int_compare()` and
+    /// `set_int_control()`
+    fn set_interrupt(&mut self, data: u8) -> Result<(), E> {
+        Ok(self.set_thing(REG_GPINTEN, data)?)
+    }
+
+    /// Read the data state from the active port. See `set_interrupt()` for
+    /// more details
+    fn interrupt(&mut self) -> Result<u8, E> {
+        Ok(self.get_thing(REG_GPINTEN)?)
+    }
+
+    /// Read output latches. This essentially reads the values set from
+    /// calling `set_data()`
+    fn latches(&mut self) -> Result<u8, E> {
+        Ok(self.get_thing(REG_OLAT)?)
+    }
+
+    /// Set polarity allows inverting the values from input pins. A
+    /// value of 1 will flip the polarity.
+    fn set_polarity(&mut self, data: u8) -> Result<(), E> {
+        Ok(self.set_thing(REG_IPOL, data)?)
+    }
+
+    /// Read the data state from the active port
+    fn polarity(&mut self) -> Result<u8, E> {
+        Ok(self.get_thing(REG_IPOL)?)
+    }
+
+    /// Set the data for the active port
+    fn set_data(&mut self, data: u8) -> Result<(), E> {
+        Ok(self.set_thing(REG_GPIO, data)?)
+    }
+
+    /// Read the data state from the active port
+    fn data(&mut self) -> Result<u8, E> {
+        Ok(self.get_thing(REG_GPIO)?)
+    }
+}
+
+impl<Bus, E> Mcp23x17Ops<Bus, E> for Mcp23s17<Bus>
+where
+    Bus: spi::Transfer<u8, Error = E>
+{
+    fn new(bus: Bus) -> Result<Self, E> where Self: Sized {
+        let mut mcp = Self {
+            bus,
+            active_port: Port::A
+        };
+        let mut data_tx = [0x41, 1, 0];
+        let val = match mcp.bus.transfer(&mut data_tx) {
+            Ok(val)  => val,
+            Err(err) => return Err(err),
+        };
+        // Check if second register is IODIRB,
+        // if yes, we're likely in BANK = 0
+        if val[2] == 0xff {
+            // We require BANK = 1
+            // So we set it
+            let mut data_tx = [0x40, 0x0a, 0b1000_0000];
+            mcp.bus.transfer(&mut data_tx)?;
+        }
+
+        Ok(mcp)
+    }
+
+    /// Some quick math for the current register
+    fn get_port(&self, register: u8) -> u8 {
+        match &self.active_port {
+            Port::A => register,
+            Port::B => 0x10 | register
+        }
+    }
+
+    fn select_port(&mut self, port: Port) {
+        self.active_port = port;
+    }
+}
+
+impl<Bus, E> Mcp23x17Ops<Bus, E> for Mcp23x17<Bus>
+where
+    Bus: i2c::WriteRead<Error = E> + i2c::Write<Error = E>
+{
+    fn new(bus: Bus) -> Result<Self, E> where Self: Sized {
         Ok(Self {
-            i2c,
-            active_port: Port::A,
+            bus,
+            active_port: Port::A
         })
     }
 
@@ -139,11 +341,51 @@ where
         }
     }
 
+    fn select_port(&mut self, port: Port) {
+        self.active_port = port;
+    }
+}
+
+
+impl<SPIBus, E> GetSetThing for Mcp23s17<SPIBus>
+where
+    SPIBus: spi::Transfer<u8, Error = E>,
+    Mcp23s17<SPIBus>: Mcp23x17Ops<SPIBus, E>
+{
+    type Error = E;
+    /// Helper function to save my typing when setting
+    fn set_thing(&mut self, register: u8, data: u8) -> Result<(), Self::Error> {
+        let reg = Self::get_port(self,register);
+        let mut data_tx = [0x40, reg, data];
+
+        Ok({
+            self.bus.transfer(&mut data_tx)?;
+            ()
+        })
+    }
+
+    /// Helper function to save my typing when reading
+    fn get_thing(&mut self, register: u8) -> Result<u8, E> {
+        let reg = self.get_port(register);
+        let mut data = [0x41, reg, 0];
+
+        self.bus.transfer(&mut data)?;
+        Ok(data[2])
+    }
+}
+
+
+impl<I2CBus, E> GetSetThing for Mcp23x17<I2CBus>
+where
+    I2CBus: i2c::WriteRead<Error = E> + i2c::Write<Error = E>,
+    Mcp23x17<I2CBus>: Mcp23x17Ops<I2CBus, E>
+{
+    type Error = E;
     /// Helper function to save my typing when setting
     fn set_thing(&mut self, register: u8, data: u8) -> Result<(), E> {
         let reg = self.get_port(register);
 
-        Ok(self.i2c.write(ADDRESS, &[reg, data])?)
+        Ok(self.bus.write(ADDRESS, &[reg, data])?)
     }
 
     /// Helper function to save my typing when reading
@@ -151,130 +393,7 @@ where
         let reg = self.get_port(register);
         let mut data = [0u8; 1];
 
-        self.i2c.write_read(ADDRESS, &[reg], &mut data)?;
+        self.bus.write_read(ADDRESS, &[reg], &mut data)?;
         Ok(data[0])
-    }
-
-    /// This chip optionally splits its registers between two eight bit ports
-    /// or virtuall one large 16 bit port. This function sets the port
-    /// internally.
-    pub fn select_port(&mut self, port: Port) {
-        self.active_port = port;
-    }
-
-    /// Set the I/O direction for the currently active port. A value
-    /// of 1 is for input, 0 for output
-    pub fn set_direction(&mut self, data: u8) -> Result<(), E> {
-        Ok(self.set_thing(REG_IODIR, data)?)
-    }
-
-    /// Get the I/O direction for the active port
-    pub fn direction(&mut self) -> Result<u8, E> {
-        Ok(self.get_thing(REG_IODIR)?)
-    }
-
-    /// Set configuration register. Given the structure of this library and how
-    /// the chip can rearrange its registers, any attempt to set the `BANK` bit
-    /// will be masked to zero.
-    pub fn set_config(&mut self, data: Config) -> Result<(), E> {
-        // Safety mechanism to avoid breaking the calls made in the library
-        let data = data.bits & !Config::BANK.bits;
-
-        Ok(self.set_thing(REG_CONFIG, data)?)
-    }
-
-    /// Read the data state from the active port
-    pub fn config(&mut self) -> Result<u8, E> {
-        Ok(self.get_thing(REG_CONFIG)?)
-    }
-
-    /// Set the pullups. A value of 1 enables the 100KOhm pullup.
-    pub fn set_pullups(&mut self, data: u8) -> Result<(), E> {
-        Ok(self.set_thing(REG_GPPU, data)?)
-    }
-
-    /// Get the pullups.
-    pub fn pullups(&mut self) -> Result<u8, E> {
-        Ok(self.get_thing(REG_GPPU)?)
-    }
-
-    /// Read interrupt state. Each pin that caused an interrupt will have
-    /// a bit is set. Not settable.
-    /// 
-    /// The value will be reset after a read from `data_at_interrupt` or
-    /// `data()`.
-    pub fn who_interrupted(&mut self) -> Result<u8, E> {
-        Ok(self.get_thing(REG_INTF)?)
-    }
-
-    /// GPIO value at time of interrupt. It will remain latched to this value
-    /// until another interrupt is fired. While it won't reset on read, it does
-    /// reset the interrupt state on the corresponding interrupt output pin
-    pub fn data_at_interrupt(&mut self) -> Result<u8, E> {
-        Ok(self.get_thing(REG_INTCAP)?)
-    }
-
-    /// Set a comparison value for the interrupts. The interrupt will
-    /// fire if the input value is *different* from what is set here
-    pub fn set_int_compare(&mut self, data: u8) -> Result<(), E> {
-        Ok(self.set_thing(REG_DEFVAL, data)?)
-    }
-
-    /// Read interrupt comparison value. Check `set_int_compare()` for more
-    /// details
-    pub fn int_compare(&mut self) -> Result<u8, E> {
-        Ok(self.get_thing(REG_DEFVAL)?)
-    }
-
-    /// Decide how interrupts will fire. If a bit is set, the input data
-    /// is compared against what's set by `int_compare()`. If unset, the
-    /// interrupt will fire when the pin has changed.
-    pub fn set_int_control(&mut self, data: u8) -> Result<(), E> {
-        Ok(self.set_thing(REG_INTCON, data)?)
-    }
-
-    /// Read how interrupts will fire. More details on `set_int_control()`.
-    pub fn int_control(&mut self) -> Result<u8, E> {
-        Ok(self.get_thing(REG_INTCON)?)
-    }
-
-    /// Enable interrupts. If a bit is set, a change on this pin will trigger an
-    /// interrupt. You'll also need to call `set_int_compare()` and
-    /// `set_int_control()`
-    pub fn set_interrupt(&mut self, data: u8) -> Result<(), E> {
-        Ok(self.set_thing(REG_GPINTEN, data)?)
-    }
-
-    /// Read the data state from the active port. See `set_interrupt()` for
-    /// more details
-    pub fn interrupt(&mut self) -> Result<u8, E> {
-        Ok(self.get_thing(REG_GPINTEN)?)
-    }
-
-    /// Read output latches. This essentially reads the values set from
-    /// calling `set_data()`
-    pub fn latches(&mut self) -> Result<u8, E> {
-        Ok(self.get_thing(REG_OLAT)?)
-    }
-
-    /// Set polarity allows inverting the values from input pins. A
-    /// value of 1 will flip the polarity.
-    pub fn set_polarity(&mut self, data: u8) -> Result<(), E> {
-        Ok(self.set_thing(REG_IPOL, data)?)
-    }
-
-    /// Read the data state from the active port
-    pub fn polarity(&mut self) -> Result<u8, E> {
-        Ok(self.get_thing(REG_IPOL)?)
-    }
-
-    /// Set the data for the active port
-    pub fn set_data(&mut self, data: u8) -> Result<(), E> {
-        Ok(self.set_thing(REG_GPIO, data)?)
-    }
-
-    /// Read the data state from the active port
-    pub fn data(&mut self) -> Result<u8, E> {
-        Ok(self.get_thing(REG_GPIO)?)
     }
 }
